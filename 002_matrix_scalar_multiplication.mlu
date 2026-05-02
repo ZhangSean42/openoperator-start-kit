@@ -92,12 +92,19 @@ __mlu_entry__ void MatrixScaleKernel(
 // =============================================================================
 // ✅ 修改 7：Host 端 Wrapper 函数参数（去掉 b，新增标量 s）
 // =============================================================================
-torch::Tensor bang_func(torch::Tensor a, float s) {
+torch::Tensor bang_func(torch::Tensor A, float s) {
     TORCH_CHECK(a.is_contiguous(), "Input a must be contiguous");
     // ✅ 修改 8：去掉对 b 的 is_contiguous() 检查
 
-    auto output = torch::empty_like(a);
-    int elem_count = a.numel();
+    auto original_dtype = A.scalar_type();
+
+    torch::Tensor A_fp32 = A;
+    if (original_dtype != torch::kFloat) {
+        A_fp32 = A.to(torch::kFloat);
+    }
+
+    auto output = torch::empty_like(A_fp32);
+    int elem_count = A_fp32.numel();
 
     // 获取 MLU 队列（无需修改）
     cnrtQueue_t queue = torch_mlu::getCurMLUStream();
@@ -112,10 +119,14 @@ torch::Tensor bang_func(torch::Tensor a, float s) {
     // ✅ 修改 9：Kernel 启动（函数名 + 参数列表）
     MatrixScaleKernel<<<dim, ktype, queue>>>(
         output.data_ptr<float>(),
-        a.data_ptr<float>(),
-        s,  // ✅ 新增：传标量 s
+        A_fp32.data_ptr<float>(),
+        (float)s,  // ✅ 新增：传标量 s
         elem_count
     );
+
+    if (original_dtype != torch::kFloat) {
+        return output.to(original_dtype);
+    }
 
     return output;
 }
