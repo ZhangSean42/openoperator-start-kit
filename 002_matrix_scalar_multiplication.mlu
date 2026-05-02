@@ -1,0 +1,121 @@
+#include <bang.h>
+#include <torch/extension.h>
+#include <cnrt.h>
+
+#ifndef TILE_ELEM
+#define TILE_ELEM 16384
+#endif
+
+#ifndef ELEM_SLICE
+#define ELEM_SLICE (TILE_ELEM * 16)
+#endif
+
+// =============================================================================
+// ✅ 修改 1：Kernel 函数名 + 功能注释
+// Kernel: MatrixScaleKernel (原 VectorAddKernel)
+// 功能：逐元素矩阵乘标量  dst[i] = a[i] * s
+// 数据类型：float32；布局：连续一维数组（矩阵自动展平）
+// =============================================================================
+
+// ✅ 修改 2：Kernel 参数列表（去掉 b，新增标量 s）
+__mlu_entry__ void MatrixScaleKernel(
+    float* dst,
+    const float* a,  // 只保留一个输入矩阵
+    const float s,  // ✅ 新增：浮点数标量乘数
+    int elem_count
+) {
+  int global_start = taskId * ELEM_SLICE;
+  if (global_start >= elem_count) return;
+  int chunk = elem_count - global_start;
+  if (chunk > ELEM_SLICE) chunk = ELEM_SLICE;
+
+  // ✅ 修改 3：去掉 nram_b（不再需要第二个输入 Buffer）
+  __nram__ float nram_a[2][TILE_ELEM];   // 输入 A 的两块乒乓 Buffer
+  __nram__ float nram_c[2][TILE_ELEM];   // 输出 C 的两块乒乓 Buffer
+
+  int total_tiles = (chunk + TILE_ELEM - 1) / TILE_ELEM;
+
+  for (int k = 0; k < total_tiles + 2; ++k) {
+    int load_buf_idx = k % 2;
+    int compute_buf_idx = (k - 1) % 2;
+    int store_buf_idx = (k - 2) % 2;
+
+    // ---------------------------
+    // 阶段1：异步Load第k个Tile
+    // ---------------------------
+    if (k < total_tiles) {
+      int offset = k * TILE_ELEM;
+      int tile_size = (offset + TILE_ELEM <= chunk) ? TILE_ELEM : (chunk - offset);
+      
+      // ✅ 修改 4：去掉加载 nram_b 的 __memcpy_async
+      __memcpy_async(nram_a[load_buf_idx], 
+                     a + global_start + offset, 
+                     tile_size * sizeof(float), 
+                     GDRAM2NRAM);
+    }
+
+    // ---------------------------
+    // 阶段2：Compute第k-1个Tile
+    // ---------------------------
+    if (k >= 1 && k < total_tiles + 1) {
+      int current_tile = k - 1;
+      int offset = current_tile * TILE_ELEM;
+      int tile_size = (offset + TILE_ELEM <= chunk) ? TILE_ELEM : (chunk - offset);
+      
+      // ✅ 修改 5：计算指令从 __bang_add 改成 __bang_mul
+      // ✅ 修改 6：第二个操作数从 nram_b 改成标量 s
+      __bang_mul_scalar(nram_c[compute_buf_idx], 
+                 nram_a[compute_buf_idx], 
+                 s,  // ✅ 直接传标量
+                 tile_size);
+    }
+
+    // ---------------------------
+    // 阶段3：异步Store第k-2个Tile
+    // ---------------------------
+    if (k >= 2 && k < total_tiles + 2) {
+      int current_tile = k - 2;
+      int offset = current_tile * TILE_ELEM;
+      int tile_size = (offset + TILE_ELEM <= chunk) ? TILE_ELEM : (chunk - offset);
+      
+      __memcpy_async(dst + global_start + offset, 
+                     nram_c[store_buf_idx], 
+                     tile_size * sizeof(float), 
+                     NRAM2GDRAM);
+    }
+
+    // 同步（和寒武纪官方3ppl写法一致，无需修改）
+    __sync();
+  }
+}
+
+// =============================================================================
+// ✅ 修改 7：Host 端 Wrapper 函数参数（去掉 b，新增标量 s）
+// =============================================================================
+torch::Tensor bang_func(torch::Tensor a, float s) {
+    TORCH_CHECK(a.is_contiguous(), "Input a must be contiguous");
+    // ✅ 修改 8：去掉对 b 的 is_contiguous() 检查
+
+    auto output = torch::empty_like(a);
+    int elem_count = a.numel();
+
+    // 获取 MLU 队列（无需修改）
+    cnrtQueue_t queue = torch_mlu::getCurMLUStream();
+
+    // 配置任务维度（无需修改）
+    int num_tasks = (elem_count + ELEM_SLICE - 1) / ELEM_SLICE;
+    if (num_tasks < 1) num_tasks = 1;
+
+    cnrtDim3_t dim = {(unsigned int)num_tasks, 1, 1};
+    cnrtFunctionType_t ktype = cnrtFuncTypeBlock;
+
+    // ✅ 修改 9：Kernel 启动（函数名 + 参数列表）
+    MatrixScaleKernel<<<dim, ktype, queue>>>(
+        output.data_ptr<float>(),
+        a.data_ptr<float>(),
+        s,  // ✅ 新增：传标量 s
+        elem_count
+    );
+
+    return output;
+}
