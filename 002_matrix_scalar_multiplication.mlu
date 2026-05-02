@@ -93,7 +93,7 @@ __mlu_entry__ void MatrixScaleKernel(
 // ✅ 修改 7：Host 端 Wrapper 函数参数（去掉 b，新增标量 s）
 // =============================================================================
 torch::Tensor bang_func(torch::Tensor A, double s) {
-    TORCH_CHECK(a.is_contiguous(), "Input a must be contiguous");
+    TORCH_CHECK(A.is_contiguous(), "Input a must be contiguous");
     // ✅ 修改 8：去掉对 b 的 is_contiguous() 检查
 
     auto original_dtype = A.scalar_type();
